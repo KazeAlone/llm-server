@@ -2,7 +2,7 @@
 
 在 Linux 的 PCIe V100S 32GB 上部署 Qwen3.8-27B。使用 llama.cpp 的 CUDA 后端，提供聊天网页、OpenAI 兼容 API 和 Prometheus 指标。
 
-默认四卡、F16 权重、32K 上下文、单请求槽位。首次执行自动编译 sm_70 后端，将已有的 Safetensors 转成 GGUF，再通过 tmux 后台运行。
+默认四卡、F16 权重、32K 上下文、单请求槽位。首次执行自动编译 sm_70 后端，将已有的 Safetensors 转成 GGUF，再通过 tmux 后台运行。已激活 Conda 时直接使用该环境安装转换依赖，否则创建 `.runtime/venv`。
 
 ## 快速开始
 
@@ -39,6 +39,8 @@ curl -f http://127.0.0.1:8080/health
 
 ## 从 Mac 访问
 
+使用 Conda 时，先按下一节准备环境，再执行 deploy。
+
 ```bash
 ssh -N -L 8080:127.0.0.1:8080 用户名@服务器地址
 ```
@@ -50,6 +52,22 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"你好，简短介绍自己。"}],"stream":true,"max_tokens":1024,"chat_template_kwargs":{"reasoning_effort":"low"}}'
 ```
+
+## 使用 Conda 或 venv
+
+推荐专门建立转换环境，避免影响其他项目。
+
+```bash
+conda create -n llm-server python=3.11 pip -y
+conda activate llm-server
+git pull
+```
+
+在 `.env` 加入 `PYTHON_ENV=conda`，然后执行 `bash llm.sh deploy`。setup、convert、deploy 都会使用 `$CONDA_PREFIX/bin/python`，日志会打印实际路径。已有 `.runtime/venv` 可以保留，Conda 模式使用激活环境。再次转换或安装依赖前，重新激活同一个 Conda 环境。启动已转换的模型由 C++ 后端执行。
+
+`PYTHON_ENV=auto` 会在激活 Conda 时使用 Conda，其余情况使用 venv。希望固定行为时显式填写 `conda` 或 `venv`。
+
+继续使用 venv 时，设置 `PYTHON_ENV=venv` 和 `PYTHON_BIN=python3.11`。已存在旧版 Python 的 venv 需要先改名备份，例如 `mv .runtime/venv .runtime/venv-backup-$(date +%s)`，再执行 deploy。只处理这个子目录，源码和已转换的模型位于 `.runtime` 的其他子目录。
 
 ## 管理命令
 
@@ -99,7 +117,8 @@ tmux 服务持续到退出或主机重启，重启服务器后执行 `bash llm.s
 | `FLASH_ATTN` | `auto` | 可改 `off` 排查兼容性 |
 | `CUDA_HOME` | 空 | 可填 `/usr/local/cuda-12.8` |
 | `BUILD_JOBS` | `8` | 编译并行任务数 |
-| `PYTHON_BIN` | `python3` | 创建转换环境的 Python，要求 >=3.10，建议 3.11/3.12 |
+| `PYTHON_ENV` | `auto` | 自动选择激活的 Conda 或 venv，也可显式指定 `conda` / `venv` |
+| `PYTHON_BIN` | `python3` | venv 模式创建环境的 Python，要求 >=3.10，建议 3.11/3.12 |
 | `LLAMA_REF` | 空 | 首次 clone 时选择 tag / commit |
 
 F16 是把 BF16 转为 FP16，均为 16-bit，转换存在舍入。Q8 会减少权重占用。转换在 CPU 上进行，生成文件大小与 GPU 运行显存不同，KV 和计算缓冲会额外占用显存。
@@ -120,7 +139,7 @@ curl http://127.0.0.1:8080/metrics
 | 问题 | 处理 |
 | --- | --- |
 | 找不到 nvcc | 安装 Toolkit 或设置 CUDA_HOME |
-| pip 找不到 numpy 2.2.6 | 检查 `.runtime/venv/bin/python --version`，NumPy 2.2.6 要求 Python >=3.10；同时检查 pip 镜像和网络 |
+| pip 找不到 numpy 2.2.6 | 查看日志打印的实际解释器并检查版本，NumPy 2.2.6 要求 Python >=3.10；同时检查 pip 镜像和网络 |
 | compute_70 不受支持 | 使用 CUDA Toolkit 12.x |
 | 缺少分片 / tokenizer | 补全原始模型目录 |
 | unknown model architecture | 后端版本可能太旧，使用支持该架构的 llama.cpp 版本 |
@@ -131,8 +150,8 @@ curl http://127.0.0.1:8080/metrics
 
 本仓库已验证 Shell 语法和模拟启动流程。完整的转换、四卡 GPU 推理、图片与工具调用需在目标服务器验收。源码仓库与 `.env` 不包含模型权重，所有运行产物保存在被 Git 忽略的 `.runtime/`。
 
-如果旧虚拟环境使用 Python 3.8/3.9，安装 Python 3.11 或 3.12 后，在 `.env` 加入 `PYTHON_BIN=python3.11`（也可使用 conda 环境解释器的完整路径）。将 `.runtime/venv` 改名备份，例如 `mv .runtime/venv .runtime/venv-old`，确认备份路径不存在后执行，再重新运行 `bash llm.sh deploy`。仅修改系统 Python 或激活其他环境不会改变已经创建的虚拟环境。
+如果旧 venv 使用 Python 3.8/3.9，可按上文切换到 Conda，或使用新版解释器重建 venv。Conda 环境本身版本太旧时，也需要创建或切换到新版 Python 的 Conda 环境。
 
-Python 版本符合要求时，可以用 `.runtime/venv/bin/python -m pip download --no-deps --only-binary=:all: --index-url https://pypi.org/simple numpy==2.2.6 -d /tmp/llm-numpy-check` 检查官方源是否提供匹配文件。若官方源成功而原安装失败，检查镜像同步、pip 配置和代理。此命令只下载，完整错误日志仍需结合实际环境判断。
+Python 版本符合要求时，用实际解释器执行 `python -m pip download --no-deps --only-binary=:all: --index-url https://pypi.org/simple numpy==2.2.6 -d /tmp/llm-numpy-check` 检查官方源是否提供匹配文件。venv 模式将命令中的 `python` 替换为 `.runtime/venv/bin/python`。若官方源成功而原安装失败，检查镜像同步、pip 配置和代理。此命令只下载，完整错误日志仍需结合实际环境判断。
 
 参考 [llama.cpp](https://github.com/ggml-org/llama.cpp)、[NVIDIA 拓扑说明](https://docs.nvidia.com/deploy/nvidia-smi/index.html)、[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)。

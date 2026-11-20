@@ -16,6 +16,7 @@ VISION=${VISION:-0}
 FLASH_ATTN=${FLASH_ATTN:-auto}
 BUILD_JOBS=${BUILD_JOBS:-8}
 PYTHON_BIN=${PYTHON_BIN:-python3}
+PYTHON_ENV=${PYTHON_ENV:-auto}
 STATE="$ROOT/.runtime"
 SOURCE="$STATE/llama.cpp"
 BINARY="$SOURCE/build-volta/bin/llama-server"
@@ -28,7 +29,25 @@ need() { command -v "$1" >/dev/null || die "缺少命令 $1，请按 README 安�
 
 check_python() {
   "$1" -c 'import sys; print("Python", sys.version.split()[0], "解释器", sys.executable); sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
-    || die "转换依赖要求 Python >=3.10。请设置 PYTHON_BIN；若旧环境已创建，先将 .runtime/venv 改名备份，再执行 setup。"
+    || die "转换依赖要求 Python >=3.10。Conda 模式请激活新版 Python 环境；venv 模式请设置 PYTHON_BIN 并备份旧 .runtime/venv 后重新 setup。"
+}
+
+select_python() {
+  local mode=$PYTHON_ENV
+  if [[ $mode == auto ]]; then
+    if [[ -n ${CONDA_PREFIX:-} ]]; then mode=conda; else mode=venv; fi
+  fi
+  case $mode in
+    conda)
+      [[ -n ${CONDA_PREFIX:-} && -x "$CONDA_PREFIX/bin/python" ]] \
+        || die "请先 conda activate 环境名，再执行命令；或设置 PYTHON_ENV=venv。"
+      CONVERT_PYTHON="$CONDA_PREFIX/bin/python"
+      ;;
+    venv) CONVERT_PYTHON="$STATE/venv/bin/python" ;;
+    *) die "PYTHON_ENV 只能是 auto、conda 或 venv" ;;
+  esac
+  SELECTED_ENV=$mode
+  echo "转换环境 $SELECTED_ENV，解释器 $CONVERT_PYTHON"
 }
 
 if [[ -n ${CUDA_HOME:-} ]]; then
@@ -71,19 +90,29 @@ doctor() {
   nvidia-smi --query-gpu=index,name,uuid,pci.bus_id,memory.total,memory.free --format=csv
   nvidia-smi topo -m
   if command -v nvcc >/dev/null; then nvcc --version; else echo "未找到 nvcc，需要 CUDA Toolkit 12.x。"; fi
-  if command -v "$PYTHON_BIN" >/dev/null; then "$PYTHON_BIN" --version; else echo "找不到 PYTHON_BIN=$PYTHON_BIN"; fi
-  if [[ -x "$STATE/venv/bin/python" ]]; then
-    "$STATE/venv/bin/python" --version
-    "$STATE/venv/bin/python" -m pip --version
+  select_python
+  if [[ -x "$CONVERT_PYTHON" ]]; then
+    "$CONVERT_PYTHON" --version
+    "$CONVERT_PYTHON" -m pip --version
+  else
+    echo "转换环境尚未创建，setup 将使用 $PYTHON_BIN 创建。"
   fi
   free -h
   df -h "$ROOT"
 }
 
 setup() {
-  need git; need cmake; need nvcc; need "$PYTHON_BIN"
-  check_python "$PYTHON_BIN"
-  if [[ -x "$STATE/venv/bin/python" ]]; then check_python "$STATE/venv/bin/python"; fi
+  select_python
+  need git; need cmake; need nvcc
+  if [[ $SELECTED_ENV == venv ]]; then
+    need "$PYTHON_BIN"
+    check_python "$PYTHON_BIN"
+    if [[ ! -x "$CONVERT_PYTHON" ]]; then
+      mkdir -p "$STATE"
+      "$PYTHON_BIN" -m venv "$STATE/venv"
+    fi
+  fi
+  check_python "$CONVERT_PYTHON"
   nvcc --version | grep -q 'release 12\.' || die "V100 编译请使用 CUDA Toolkit 12.x，建议 12.8。"
   mkdir -p "$STATE/models"
   if [[ ! -d "$SOURCE/.git" ]]; then
@@ -94,17 +123,18 @@ setup() {
   cmake -S "$SOURCE" -B "$SOURCE/build-volta" \
     -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release
   cmake --build "$SOURCE/build-volta" --target llama-server -j "$BUILD_JOBS"
-  if [[ ! -x "$STATE/venv/bin/python" ]]; then "$PYTHON_BIN" -m venv "$STATE/venv"; fi
-  "$STATE/venv/bin/python" -m pip install --upgrade pip
-  "$STATE/venv/bin/python" -m pip install \
+  "$CONVERT_PYTHON" -m pip install --upgrade pip
+  "$CONVERT_PYTHON" -m pip install \
     -r "$SOURCE/requirements/requirements-convert_hf_to_gguf.txt"
   "$BINARY" --version
 }
 
 convert() {
+  select_python
   [[ -d "$MODEL_DIR" ]] || die "请在 .env 填写有效 MODEL_DIR。"
-  [[ -x "$STATE/venv/bin/python" ]] || die "请先执行 setup。"
-  "$STATE/venv/bin/python" - "$MODEL_DIR" <<'PY'
+  [[ -x "$CONVERT_PYTHON" ]] || die "请先执行 setup。"
+  check_python "$CONVERT_PYTHON"
+  "$CONVERT_PYTHON" - "$MODEL_DIR" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -123,14 +153,14 @@ print(f"已检查 {len(shards)} 个权重分片。")
 PY
   # 临时文件仅在转换成功后改名，重试不会复用中断产物。
   if [[ ! -s "$MODEL" ]]; then
-    "$STATE/venv/bin/python" "$SOURCE/convert_hf_to_gguf.py" "$MODEL_DIR" \
+    "$CONVERT_PYTHON" "$SOURCE/convert_hf_to_gguf.py" "$MODEL_DIR" \
       --outtype "$PRECISION" --outfile "$MODEL.partial"
     mv -- "$MODEL.partial" "$MODEL"
   else
     echo "复用 $MODEL"
   fi
   if [[ $VISION == 1 && ! -s "$PROJECTOR" ]]; then
-    "$STATE/venv/bin/python" "$SOURCE/convert_hf_to_gguf.py" "$MODEL_DIR" \
+    "$CONVERT_PYTHON" "$SOURCE/convert_hf_to_gguf.py" "$MODEL_DIR" \
       --mmproj --outtype f16 --outfile "$PROJECTOR.partial"
     mv -- "$PROJECTOR.partial" "$PROJECTOR"
   fi
