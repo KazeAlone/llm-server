@@ -99,6 +99,7 @@ tmux 服务持续到退出或主机重启，重启服务器后执行 `bash llm.s
 | `FLASH_ATTN` | `auto` | 可改 `off` 排查兼容性 |
 | `CUDA_HOME` | 空 | 可填 `/usr/local/cuda-12.8` |
 | `BUILD_JOBS` | `8` | 编译并行任务数 |
+| `PYTHON_BIN` | `python3` | 创建转换环境的 Python，要求 >=3.10，建议 3.11/3.12 |
 | `LLAMA_REF` | 空 | 首次 clone 时选择 tag / commit |
 
 F16 是把 BF16 转为 FP16，均为 16-bit，转换存在舍入。Q8 会减少权重占用。转换在 CPU 上进行，生成文件大小与 GPU 运行显存不同，KV 和计算缓冲会额外占用显存。
@@ -119,6 +120,7 @@ curl http://127.0.0.1:8080/metrics
 | 问题 | 处理 |
 | --- | --- |
 | 找不到 nvcc | 安装 Toolkit 或设置 CUDA_HOME |
+| pip 找不到 numpy 2.2.6 | 检查 `.runtime/venv/bin/python --version`，NumPy 2.2.6 要求 Python >=3.10；同时检查 pip 镜像和网络 |
 | compute_70 不受支持 | 使用 CUDA Toolkit 12.x |
 | 缺少分片 / tokenizer | 补全原始模型目录 |
 | unknown model architecture | 后端版本可能太旧，使用支持该架构的 llama.cpp 版本 |
@@ -128,5 +130,9 @@ curl http://127.0.0.1:8080/metrics
 | CUDA 无可用 kernel | 检查实际二进制是否为本脚本构建的 sm_70 版本 |
 
 本仓库已验证 Shell 语法和模拟启动流程。完整的转换、四卡 GPU 推理、图片与工具调用需在目标服务器验收。源码仓库与 `.env` 不包含模型权重，所有运行产物保存在被 Git 忽略的 `.runtime/`。
+
+如果旧虚拟环境使用 Python 3.8/3.9，安装 Python 3.11 或 3.12 后，在 `.env` 加入 `PYTHON_BIN=python3.11`（也可使用 conda 环境解释器的完整路径）。将 `.runtime/venv` 改名备份，例如 `mv .runtime/venv .runtime/venv-old`，确认备份路径不存在后执行，再重新运行 `bash llm.sh deploy`。仅修改系统 Python 或激活其他环境不会改变已经创建的虚拟环境。
+
+Python 版本符合要求时，可以用 `.runtime/venv/bin/python -m pip download --no-deps --only-binary=:all: --index-url https://pypi.org/simple numpy==2.2.6 -d /tmp/llm-numpy-check` 检查官方源是否提供匹配文件。若官方源成功而原安装失败，检查镜像同步、pip 配置和代理。此命令只下载，完整错误日志仍需结合实际环境判断。
 
 参考 [llama.cpp](https://github.com/ggml-org/llama.cpp)、[NVIDIA 拓扑说明](https://docs.nvidia.com/deploy/nvidia-smi/index.html)、[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)。

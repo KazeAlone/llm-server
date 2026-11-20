@@ -15,6 +15,7 @@ PRECISION=${PRECISION:-f16}
 VISION=${VISION:-0}
 FLASH_ATTN=${FLASH_ATTN:-auto}
 BUILD_JOBS=${BUILD_JOBS:-8}
+PYTHON_BIN=${PYTHON_BIN:-python3}
 STATE="$ROOT/.runtime"
 SOURCE="$STATE/llama.cpp"
 BINARY="$SOURCE/build-volta/bin/llama-server"
@@ -24,6 +25,11 @@ SESSION="llm-$(printf '%s' "$ROOT" | sha256sum | cut -c1-12)"
 
 die() { echo "错误：$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || die "缺少命令 $1，请按 README 安装依赖。"; }
+
+check_python() {
+  "$1" -c 'import sys; print("Python", sys.version.split()[0], "解释器", sys.executable); sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
+    || die "转换依赖要求 Python >=3.10。请设置 PYTHON_BIN；若旧环境已创建，先将 .runtime/venv 改名备份，再执行 setup。"
+}
 
 if [[ -n ${CUDA_HOME:-} ]]; then
   export PATH="$CUDA_HOME/bin:$PATH"
@@ -65,12 +71,19 @@ doctor() {
   nvidia-smi --query-gpu=index,name,uuid,pci.bus_id,memory.total,memory.free --format=csv
   nvidia-smi topo -m
   if command -v nvcc >/dev/null; then nvcc --version; else echo "未找到 nvcc，需要 CUDA Toolkit 12.x。"; fi
+  if command -v "$PYTHON_BIN" >/dev/null; then "$PYTHON_BIN" --version; else echo "找不到 PYTHON_BIN=$PYTHON_BIN"; fi
+  if [[ -x "$STATE/venv/bin/python" ]]; then
+    "$STATE/venv/bin/python" --version
+    "$STATE/venv/bin/python" -m pip --version
+  fi
   free -h
   df -h "$ROOT"
 }
 
 setup() {
-  need git; need cmake; need nvcc; need python3
+  need git; need cmake; need nvcc; need "$PYTHON_BIN"
+  check_python "$PYTHON_BIN"
+  if [[ -x "$STATE/venv/bin/python" ]]; then check_python "$STATE/venv/bin/python"; fi
   nvcc --version | grep -q 'release 12\.' || die "V100 编译请使用 CUDA Toolkit 12.x，建议 12.8。"
   mkdir -p "$STATE/models"
   if [[ ! -d "$SOURCE/.git" ]]; then
@@ -81,7 +94,8 @@ setup() {
   cmake -S "$SOURCE" -B "$SOURCE/build-volta" \
     -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release
   cmake --build "$SOURCE/build-volta" --target llama-server -j "$BUILD_JOBS"
-  if [[ ! -x "$STATE/venv/bin/python" ]]; then python3 -m venv "$STATE/venv"; fi
+  if [[ ! -x "$STATE/venv/bin/python" ]]; then "$PYTHON_BIN" -m venv "$STATE/venv"; fi
+  "$STATE/venv/bin/python" -m pip install --upgrade pip
   "$STATE/venv/bin/python" -m pip install \
     -r "$SOURCE/requirements/requirements-convert_hf_to_gguf.txt"
   "$BINARY" --version
