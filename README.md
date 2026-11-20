@@ -67,6 +67,8 @@ git pull
 
 `PYTHON_ENV=auto` 会在激活 Conda 时使用 Conda，其余情况使用 venv。希望固定行为时显式填写 `conda` 或 `venv`。
 
+setup 优先复用该环境中能够正常导入的 Torch，包括已有的 2.10。安装其他转换依赖时，脚本移除上游对 Torch 的直接固定版本，并通过 pip constraints 约束当前 Torch 版本。若其他依赖与当前版本冲突，pip 会报错，需要结合日志处理。环境没有 Torch 时按上游 requirements 安装。安装后会运行转换器 `--help` 检查入口导入，完整模型转换仍需实际验证。llama-server 推理由 C++ / CUDA 后端执行，Torch 用于 Python 转换步骤。
+
 继续使用 venv 时，设置 `PYTHON_ENV=venv` 和 `PYTHON_BIN=python3.11`。已存在旧版 Python 的 venv 需要先改名备份，例如 `mv .runtime/venv .runtime/venv-backup-$(date +%s)`，再执行 deploy。只处理这个子目录，源码和已转换的模型位于 `.runtime` 的其他子目录。
 
 ## 管理命令

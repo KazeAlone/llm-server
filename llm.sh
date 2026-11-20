@@ -124,8 +124,9 @@ setup() {
     -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release
   cmake --build "$SOURCE/build-volta" --target llama-server -j "$BUILD_JOBS"
   "$CONVERT_PYTHON" -m pip install --upgrade pip
-  "$CONVERT_PYTHON" -m pip install \
-    -r "$SOURCE/requirements/requirements-convert_hf_to_gguf.txt"
+  "$CONVERT_PYTHON" "$ROOT/install_conversion_deps.py" \
+    "$SOURCE/requirements/requirements-convert_hf_to_gguf.txt"
+  "$CONVERT_PYTHON" "$SOURCE/convert_hf_to_gguf.py" --help >/dev/null
   "$BINARY" --version
 }
 
