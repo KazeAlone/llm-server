@@ -15,6 +15,9 @@ API_KEY=${API_KEY:-${LLAMA_API_KEY:-}}
 PRECISION=${PRECISION:-f16}
 VISION=${VISION:-0}
 FLASH_ATTN=${FLASH_ATTN:-auto}
+BATCH_SIZE=${BATCH_SIZE:-512}
+UBATCH_SIZE=${UBATCH_SIZE:-128}
+REASONING_EFFORT=${REASONING_EFFORT:-}
 BUILD_JOBS=${BUILD_JOBS:-8}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 PYTHON_ENV=${PYTHON_ENV:-auto}
@@ -57,6 +60,13 @@ if [[ -n ${CUDA_HOME:-} ]]; then
 fi
 [[ $PRECISION == f16 || $PRECISION == q8_0 ]] || die "PRECISION 只能是 f16 或 q8_0"
 [[ $VISION == 0 || $VISION == 1 ]] || die "VISION 只能是 0 或 1"
+case $REASONING_EFFORT in
+  ''|low|medium|xhigh) ;;
+  *) die "REASONING_EFFORT 只能为空、low、medium 或 xhigh" ;;
+esac
+[[ $BATCH_SIZE =~ ^[1-9][0-9]*$ && $UBATCH_SIZE =~ ^[1-9][0-9]*$ ]] \
+  || die "BATCH_SIZE 和 UBATCH_SIZE 必须为正整数"
+(( UBATCH_SIZE <= BATCH_SIZE )) || die "UBATCH_SIZE 不能大于 BATCH_SIZE"
 
 # flock 的父进程持锁，子进程关闭锁描述符，避免 tmux 服务继承锁。
 case ${1:-help} in
@@ -74,6 +84,7 @@ help_text() {
   cat <<'EOF'
 用法 bash llm.sh <命令>
   doctor   显示 GPU、拓扑、CUDA、内存及磁盘
+  diagnose 显示性能配置、GPU 状态及最近推理耗时
   deploy   编译后端、转换已有权重、后台启动（复用已有结果）
   setup    编译 sm_70 后端并建立转换环境
   convert  将 MODEL_DIR 转换为 GGUF，VISION=1 时同时转换视觉模块
@@ -203,11 +214,14 @@ PY
   local args=(
     --model "$MODEL" --alias qwen3.8-27b
     --n-gpu-layers all --split-mode layer --tensor-split "$split"
-    --ctx-size "$CTX_SIZE" --parallel 1 --batch-size 512 --ubatch-size 128
+    --ctx-size "$CTX_SIZE" --parallel 1 --batch-size "$BATCH_SIZE" --ubatch-size "$UBATCH_SIZE"
     --cache-type-k f16 --cache-type-v f16 --flash-attn "$FLASH_ATTN"
     --jinja --temp 1.0 --top-p 0.95 --top-k 20 --metrics
     --host "$HOST" --port "$PORT"
   )
+  if [[ -n $REASONING_EFFORT ]]; then
+    args+=(--chat-template-kwargs "{\"reasoning_effort\":\"$REASONING_EFFORT\"}")
+  fi
   if [[ $VISION == 1 ]]; then
     [[ -s "$PROJECTOR" ]] || die "缺少视觉模块，请执行 convert。"
     args+=(--mmproj "$PROJECTOR")
@@ -215,6 +229,23 @@ PY
   # llama-server 原生读取该环境变量，避免把密钥放入命令行参数。
   export LLAMA_API_KEY="$API_KEY"
   exec "$BINARY" "${args[@]}"
+}
+
+diagnose() {
+  echo "配置 PRECISION=$PRECISION GPU_IDS=$GPU_IDS CTX_SIZE=$CTX_SIZE"
+  echo "批次 BATCH_SIZE=$BATCH_SIZE UBATCH_SIZE=$UBATCH_SIZE FLASH_ATTN=$FLASH_ATTN"
+  echo "思考 REASONING_EFFORT=${REASONING_EFFORT:-模型默认}，并发槽位 1"
+  if [[ -f "$STATE/llama-cpp-commit.txt" ]]; then cat "$STATE/llama-cpp-commit.txt"; fi
+  if command -v nvidia-smi >/dev/null; then
+    nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu,power.draw,temperature.gpu --format=csv
+    nvidia-smi topo -m
+  fi
+  if [[ -f "$STATE/server.log" ]]; then
+    echo "最近加载与耗时记录"
+    { grep -E 'prompt eval time|eval time|offloaded|flash_attn|CUDA.*buffer|KV.*buffer' "$STATE/server.log" || true; } | tail -n 60
+  else
+    echo "暂无后台日志，请先通过 start 启动并完成一次请求。"
+  fi
 }
 
 start() {
@@ -286,6 +317,7 @@ status() {
 case ${1:-help} in
   help|--help|-h) help_text ;;
   doctor) doctor ;;
+  diagnose) diagnose ;;
   setup) setup ;;
   convert) convert ;;
   deploy) need tmux; setup; convert; start ;;

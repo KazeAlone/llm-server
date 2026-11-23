@@ -108,6 +108,7 @@ setup 优先复用该环境中能够正常导入的 Torch，包括已有的 2.10
 | 命令 | 用途 |
 | --- | --- |
 | `bash llm.sh doctor` | 查看 GPU、拓扑、Toolkit、主机内存和磁盘 |
+| `bash llm.sh diagnose` | 查看性能配置、GPU 快照、拓扑与最近输入/生成耗时 |
 | `bash llm.sh setup` | 编译后端并安装转换依赖 |
 | `bash llm.sh convert` | 转换权重，成功后才发布最终文件 |
 | `bash llm.sh start` | 在 tmux 中启动后台服务 |
@@ -151,6 +152,9 @@ tmux 服务持续到退出或主机重启，重启服务器后执行 `bash llm.s
 | `HOST` | `127.0.0.1` | 默认仅本机监听 |
 | `API_KEY` | 空 | 推理 API 密钥，修改后重启服务 |
 | `FLASH_ATTN` | `auto` | 可改 `off` 排查兼容性 |
+| `REASONING_EFFORT` | 空 | 默认遵循模型模板，可显式设 `low` / `medium` / `xhigh` |
+| `BATCH_SIZE` | `512` | 逻辑输入批次 |
+| `UBATCH_SIZE` | `128` | 物理输入批次，需小于等于 BATCH_SIZE |
 | `CUDA_HOME` | 空 | 可填 `/usr/local/cuda-12.8` |
 | `BUILD_JOBS` | `8` | 编译并行任务数 |
 | `PYTHON_ENV` | `auto` | 自动选择激活的 Conda 或 venv，也可显式指定 `conda` / `venv` |
@@ -171,6 +175,18 @@ curl http://127.0.0.1:8080/metrics
 `--metrics` 默认开启，可由 Prometheus 采集。重点看 `llamacpp:prompt_tokens_seconds`、`llamacpp:predicted_tokens_seconds`、`llamacpp:requests_processing`、`llamacpp:requests_deferred`。长期 GPU 历史监控可以增加 DCGM Exporter 和 Grafana。
 
 ## 排查
+
+### 服务很慢
+
+先完成一条真实请求，再执行 `bash llm.sh diagnose`。在请求生成过程中运行 `nvidia-smi -l 1`，观察有无其他占用和异常显存。日志的 `prompt eval time` 对应输入处理，`eval time` 对应输出生成。客户端等到正文的时间还可能包含模型思考和排队。
+
+1. 正文等待过久时，先在 `.env` 设置 `REASONING_EFFORT=low` 并执行 restart，对比同一问题。客户端显式传入的 `chat_template_kwargs` 可以覆盖服务默认值。降低思考强度可能影响复杂任务成功率。
+2. 输入处理慢且显存有余量时，比较 `UBATCH_SIZE=128` 和 `256`，每次修改后 restart；较大批次可能增加显存峰值。保留测得更快的一组。
+3. F16 四卡的单请求生成速度慢时，可以对比同拓扑组的两卡配置，但 F16 约 54GB，再加 KV 和缓冲后两卡可能余量不足。可先用短上下文验证，完整 GPU 卸载以日志为准。
+4. 若接受量化，可使用 `PRECISION=q8_0` 后执行 convert，对比 Q8 两卡和原 F16 配置。权重减小可能降低读取成本，实际吞吐也受 Volta 的量化算子与 PCIe 拓扑影响。
+5. 当前脚本固定一个请求槽位，多人请求会排队。先测单请求性能，再决定是否用两组卡运行副本或调整并发。
+
+逐项修改，以同一输入、同一输出长度对照。当前按层分卡时，一个序列逐层经过各 GPU，四卡不保证单请求四倍速度。保留 `FLASH_ATTN=auto`，通过日志确认实际启用情况。V100 上的具体速度以测量为准。
 
 | 问题 | 处理 |
 | --- | --- |
