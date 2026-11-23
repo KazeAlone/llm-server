@@ -111,12 +111,13 @@ setup 优先复用该环境中能够正常导入的 Torch，包括已有的 2.10
 | `bash llm.sh setup` | 编译后端并安装转换依赖 |
 | `bash llm.sh convert` | 转换权重，成功后才发布最终文件 |
 | `bash llm.sh start` | 在 tmux 中启动后台服务 |
+| `bash llm.sh restart` | 等待旧服务退出，再按当前 .env 配置启动 |
 | `bash llm.sh run` | 前台运行，Ctrl+C 停止 |
 | `bash llm.sh status` | 查看后台会话、健康检查和 GPU |
 | `bash llm.sh logs` | 查看后台加载和推理日志 |
 | `bash llm.sh stop` | 请求停止本目录启动的后台服务 |
 
-tmux 服务持续到退出或主机重启，重启服务器后执行 `bash llm.sh start`。修改运行参数后执行 stop，用 status 确认退出，再 start。日志保存在 `.runtime/server.log`，每次后台启动重新写入。
+tmux 服务持续到退出或主机重启，重启服务器后执行 `bash llm.sh start`。修改 HOST、PORT、API_KEY 等运行参数后执行 `bash llm.sh restart`。stop 会查询 pane ID 发送 Ctrl+C，并等待最多 30 秒退出，超时会报错，restart 随之停止。日志保存在 `.runtime/server.log`，每次后台启动重新写入。
 
 ## 用 topo 选卡
 

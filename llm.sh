@@ -60,7 +60,7 @@ fi
 
 # flock 的父进程持锁，子进程关闭锁描述符，避免 tmux 服务继承锁。
 case ${1:-help} in
-  setup|convert|deploy|start|stop)
+  setup|convert|deploy|start|stop|restart)
     if [[ ${LLM_DEPLOY_LOCKED:-0} != 1 ]]; then
       need flock
       mkdir -p "$STATE"
@@ -79,6 +79,7 @@ help_text() {
   convert  将 MODEL_DIR 转换为 GGUF，VISION=1 时同时转换视觉模块
   run      在当前终端运行服务，Ctrl+C 停止
   start    在 tmux 中后台启动，加载过程查看 logs
+  restart  停止旧服务并按当前 .env 配置启动
   status   检查后台会话、GPU 占用、HTTP 健康状态
   logs     持续查看日志，Ctrl+C 退出查看
   stop     向本项目的 tmux 会话发送 Ctrl+C
@@ -229,6 +230,42 @@ start() {
   echo "服务地址 http://$HOST:$PORT，API 路径 /v1，监控路径 /metrics"
 }
 
+stop() {
+  need tmux
+  if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
+    echo "没有后台会话。"
+    return
+  fi
+  # send-keys 接受 pane 目标。先从本项目会话查询稳定的 pane ID。
+  local panes pane
+  panes=$(tmux list-panes -s -t "$SESSION" -F '#{pane_id}')
+  pane=${panes%%$'\n'*}
+  [[ -n $pane ]] || die "会话内没有可用 pane，请执行 tmux list-panes -a 检查。"
+  if ! tmux send-keys -t "$pane" C-c; then
+    if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
+      echo "服务已退出。"
+      return
+    fi
+    die "停止信号发送失败，请查看 tmux 会话。"
+  fi
+  local attempt dead
+  for ((attempt=0; attempt<30; attempt++)); do
+    if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
+      echo "服务已停止。"
+      return
+    fi
+    dead=$(tmux display-message -p -t "$pane" '#{pane_dead}' 2>/dev/null || true)
+    if [[ $dead == 1 ]]; then
+      # 兼容用户配置 remain-on-exit 的情况，仅移除已退出的 pane。
+      tmux kill-pane -t "$pane"
+      echo "服务已停止。"
+      return
+    fi
+    sleep 1
+  done
+  die "等待服务退出超时，未启动新服务。请查看 logs 和 tmux 会话。"
+}
+
 status() {
   if command -v tmux >/dev/null && tmux has-session -t "=$SESSION" 2>/dev/null; then
     echo "后台会话存在。"
@@ -254,16 +291,9 @@ case ${1:-help} in
   deploy) need tmux; setup; convert; start ;;
   run) run ;;
   start) start ;;
+  restart) stop; start ;;
   status) status ;;
   logs) [[ -f "$STATE/server.log" ]] || die "暂无后台日志。"; tail -n 100 -F "$STATE/server.log" ;;
-  stop)
-    need tmux
-    if tmux has-session -t "=$SESSION" 2>/dev/null; then
-      tmux send-keys -t "=$SESSION" C-c
-      echo "已发送停止信号，请通过 status 确认退出。"
-    else
-      echo "没有后台会话。"
-    fi
-    ;;
+  stop) stop ;;
   *) help_text; exit 1 ;;
 esac
