@@ -53,6 +53,38 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"你好，简短介绍自己。"}],"stream":true,"max_tokens":1024,"chat_template_kwargs":{"reasoning_effort":"low"}}'
 ```
 
+## 配置 API Key
+
+生成一个密钥，将输出保存在本机 `.env` 的 `API_KEY`，客户端也填写同一字符串。
+
+```bash
+python -c 'import secrets; print(secrets.token_hex(32))'
+```
+
+`.env` 示例，端口按本机实际配置填写。
+
+```bash
+HOST=0.0.0.0
+PORT=8081
+API_KEY="替换成刚生成的密钥"
+```
+
+执行 `bash llm.sh stop`，再用 `bash llm.sh status` 确认旧进程退出，然后执行 `bash llm.sh start`。设置密钥只需要重启服务。密钥通过 llama-server 原生的 `LLAMA_API_KEY` 环境变量传入，日志和进程命令行参数不包含该值。`.env` 已被 Git 忽略。
+
+局域网客户端的 Base URL 填 `http://服务器局域网IP:8081/v1`，API Key 填生成的字符串，Model ID 填 `qwen3.8-27b`。HTTP 请求头使用 `Authorization: Bearer 密钥`。
+
+```bash
+read -r -s -p 'API Key: ' QWEN_CLIENT_KEY
+echo
+curl -N http://服务器局域网IP:8081/v1/chat/completions \
+  -H "Authorization: Bearer $QWEN_CLIENT_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"你好"}],"max_tokens":256,"stream":true}'
+unset QWEN_CLIENT_KEY
+```
+
+验证鉴权时使用推理接口，分别测试正确、错误和未提供密钥的情况。`/health` 等公共端点可能允许匿名访问，不能用健康检查成功来判断鉴权是否生效。内置聊天网页需要在其 API Key 设置中填相同密钥。
+
 ## 使用 Conda 或 venv
 
 推荐专门建立转换环境，避免影响其他项目。
@@ -116,6 +148,7 @@ tmux 服务持续到退出或主机重启，重启服务器后执行 `bash llm.s
 | `CTX_SIZE` | `32768` | 输入与输出合计容量 |
 | `PORT` | `8080` | HTTP 服务端口 |
 | `HOST` | `127.0.0.1` | 默认仅本机监听 |
+| `API_KEY` | 空 | 推理 API 密钥，修改后重启服务 |
 | `FLASH_ATTN` | `auto` | 可改 `off` 排查兼容性 |
 | `CUDA_HOME` | 空 | 可填 `/usr/local/cuda-12.8` |
 | `BUILD_JOBS` | `8` | 编译并行任务数 |

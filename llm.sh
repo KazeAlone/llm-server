@@ -11,6 +11,7 @@ GPU_IDS=${GPU_IDS:-0,1,2,3}
 CTX_SIZE=${CTX_SIZE:-32768}
 PORT=${PORT:-8080}
 HOST=${HOST:-127.0.0.1}
+API_KEY=${API_KEY:-${LLAMA_API_KEY:-}}
 PRECISION=${PRECISION:-f16}
 VISION=${VISION:-0}
 FLASH_ATTN=${FLASH_ATTN:-auto}
@@ -210,6 +211,8 @@ PY
     [[ -s "$PROJECTOR" ]] || die "缺少视觉模块，请执行 convert。"
     args+=(--mmproj "$PROJECTOR")
   fi
+  # llama-server 原生读取该环境变量，避免把密钥放入命令行参数。
+  export LLAMA_API_KEY="$API_KEY"
   exec "$BINARY" "${args[@]}"
 }
 
