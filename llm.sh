@@ -14,6 +14,7 @@ HOST=${HOST:-127.0.0.1}
 API_KEY=${API_KEY:-${LLAMA_API_KEY:-}}
 PRECISION=${PRECISION:-f16}
 VISION=${VISION:-0}
+MEDIA_PATH=${MEDIA_PATH-/}
 FLASH_ATTN=${FLASH_ATTN:-auto}
 BATCH_SIZE=${BATCH_SIZE:-512}
 UBATCH_SIZE=${UBATCH_SIZE:-128}
@@ -225,6 +226,10 @@ PY
   if [[ $VISION == 1 ]]; then
     [[ -s "$PROJECTOR" ]] || die "缺少视觉模块，请执行 convert。"
     args+=(--mmproj "$PROJECTOR")
+  fi
+  if [[ -n $MEDIA_PATH ]]; then
+    [[ -d "$MEDIA_PATH" ]] || die "MEDIA_PATH 目录不存在：$MEDIA_PATH"
+    args+=(--media-path "$MEDIA_PATH")
   fi
   # llama-server 原生读取该环境变量，避免把密钥放入命令行参数。
   export LLAMA_API_KEY="$API_KEY"

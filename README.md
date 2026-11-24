@@ -147,6 +147,7 @@ tmux 服务持续到退出或主机重启，重启服务器后执行 `bash llm.s
 | `GPU_IDS` | `0,1,2,3` | 指定 GPU 顺序 |
 | `PRECISION` | `f16` | 可设 `q8_0`，重新 convert / deploy |
 | `VISION` | `0` | 设为 `1` 后 convert，会额外生成视觉模块 |
+| `MEDIA_PATH` | `/` | 本地媒体文件根目录，空字符串关闭本地文件访问 |
 | `CTX_SIZE` | `32768` | 输入与输出合计容量 |
 | `PORT` | `8080` | HTTP 服务端口 |
 | `HOST` | `127.0.0.1` | 默认仅本机监听 |
@@ -162,6 +163,25 @@ tmux 服务持续到退出或主机重启，重启服务器后执行 `bash llm.s
 | `LLAMA_REF` | 空 | 首次 clone 时选择 tag / commit |
 
 F16 是把 BF16 转为 FP16，均为 16-bit，转换存在舍入。Q8 会减少权重占用。转换在 CPU 上进行，生成文件大小与 GPU 运行显存不同，KV 和计算缓冲会额外占用显存。
+
+## 本机图片输入
+
+按用户的根目录访问需求，脚本默认传入 `--media-path /`。已有 `.env` 无需补充该字段即可使用此默认值。设置 `MEDIA_PATH=""` 可关闭本地文件访问，也可设置为具体图片目录。
+
+图片输入需要在 `.env` 中设置 `VISION=1`。首次启用后，执行 `bash llm.sh convert` 生成视觉模块，再执行 `bash llm.sh restart` 加载。
+
+例如服务器图片位于 `/data/images/test.jpg`，请求中的消息内容可以写为以下形式。
+
+```json
+[
+  {"type": "text", "text": "请描述这张图片。"},
+  {"type": "image_url", "image_url": {"url": "file://data/images/test.jpg"}}
+]
+```
+
+`file://` 后填写相对于 MEDIA_PATH 的路径。若改成 `MEDIA_PATH="/data/images"`，同一图片使用 `file://test.jpg`。目录必须存在于模型服务器上，且服务进程具有读取权限。根目录配置的访问范围覆盖整个服务器文件系统中进程可读的媒体文件。
+
+修改 MEDIA_PATH 后执行 `bash llm.sh restart`。通过其他电脑调用时，客户端电脑上的图片可以用 Base64 data URI 发送。当前更新仅涉及启动参数和说明，目标 GPU 上的图片推理仍需实测。
 
 ## UI 和监控
 
