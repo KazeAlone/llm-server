@@ -1,229 +1,185 @@
-# llm-server
+# llm-server：四套 V100S 部署方式
 
-在 Linux 的 PCIe V100S 32GB 上部署 Qwen3.8-27B。使用 llama.cpp 的 CUDA 后端，提供聊天网页、OpenAI 兼容 API 和 Prometheus 指标。
+面向 Linux、4× **PCIe V100S 32GB（sm_70）**、本地 Qwen3.8-27B 权重。每种方式一个目录，各自配置、日志、启停入口；使用 **Conda**，不创建隐藏的 Python venv。
 
-默认四卡、F16 权重、32K 上下文、单请求槽位。首次执行自动编译 sm_70 后端，将已有的 Safetensors 转成 GGUF，再通过 tmux 后台运行。已激活 Conda 时直接使用该环境安装转换依赖，否则创建 `.runtime/venv`。
+| 目录 | 权重 | 默认 API / UI 端口 | 环境与定位 |
+|---|---|---|---|
+| [`llama.cpp/`](llama.cpp/) | 原始权重转换 GGUF，F16 / Q8_0 + mmproj | 8080 / 8180 | 保留现有部署，转换优先复用当前 Torch；推理不依赖 Torch |
+| [`transformers/`](transformers/) | 直接加载原始 BF16 Safetensors，运行时 FP16 | 8081 / 8181 | 优先复用 Torch 2.10，支持文本、图片、流式 API；作为兼容性基线 |
+| [`vllm/`](vllm/) | 同上 | 8082 / 8182 | 固定 v0.19.1 源码编译 sm_70，优先复用 Torch 2.10；V100 实验路线 |
+| [`sglang/`](sglang/) | 同上 | 8083 / 8183 | 固定 SGLang-V100 适配源码；该版要求 Torch 2.9.1/cu128，使用独立 Conda 环境 |
 
-## 快速开始
+**这里没有在真实 V100 上执行编译、加载和测速。** CPU 测试覆盖脚本参数、选卡、API 鉴权、图片路径限制、流式返回/异常和 UI 代理。vLLM/SGLang 的 V100 路线需要本机实测，不能保证超过现有 llama.cpp，更不能照搬 NVLink 机器的速度。
 
-需要 NVIDIA 驱动、CUDA Toolkit 12.x（建议 12.8）、Python 3.10+。用 `nvcc --version` 检查 Toolkit。`nvidia-smi` 顶部的 CUDA Version 是驱动支持上限。为转换准备充足主机内存，建议可用内存 64GB 以上，并在仓库所在磁盘预留约 70GB 输出空间。实际内存需求随模型和转换版本变化。
-
-Ubuntu / Debian 先安装工具。其他发行版使用对应包管理器。
+## 已经部署过：直接拉取，不覆盖原配置
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y build-essential cmake git python3 python3-venv python3-pip libcurl4-openssl-dev curl tmux
+git pull --ff-only
+bash llm.sh status
+```
 
-git clone https://github.com/KazeAlone/llm-server.git
-cd llm-server
-cp .env.example .env
+原来的根目录 `.env`、`.runtime`、GGUF、mmproj、编译产物、tmux 会话都继续使用，根目录 `bash llm.sh ...` 仍指向 llama.cpp。**不需要重新复制 `.env`、转换模型或重建后端。**
+
+新入口 `bash llama.cpp/llm.sh ...` 与根入口控制同一个服务。llama.cpp 优先读取 `llama.cpp/.env`，没有才读取旧根目录 `.env`；已有用户可继续保留根配置。新三套方式不自动读取根配置，避免把 GGUF 参数误传给其他后端。
+
+## 先试 Transformers，再试 vLLM / SGLang
+
+先停止占卡的旧服务，不要同时加载多个 27B FP16 实例。后台安装本身不等于模型已加载，但环境自检和部分编译会访问 GPU。
+
+```bash
+# 仓库根目录；先激活你已有的 Torch 2.10 环境
+conda activate 你的环境名
+bash llm.sh stop
+
+cd transformers
+# 仅第一次复制，之后只编辑已有 .env
+cp -n .env.example .env
 nano .env
 ```
 
-至少修改 `MODEL_DIR`，填现有 18 个权重分片所在目录。目录需包含配置、tokenizer、`model.safetensors.index.json` 和所有分片。
+至少改这些，**MODEL_DIR 指向含 config.json 和 18 个原始分片的目录，不是 GGUF 文件**：
+
+```bash
+MODEL_DIR="/data/models/Qwen3.8-27B"
+GPU_IDS="0,1,2,3"
+HOST="0.0.0.0"
+PORT=8081
+API_KEY="自己设置一个长密钥"
+CTX_SIZE=8192
+VISION=1
+MEDIA_PATH="/"
+CUDA_HOME="/usr/local/cuda-12.8"
+```
 
 ```bash
 bash llm.sh doctor
-bash llm.sh deploy
-bash llm.sh logs
+bash llm.sh setup      # 安装依赖；Transformers 不转换权重
+bash llm.sh start      # tmux 后台启动
+bash llm.sh logs       # 等到模型加载完成；Ctrl+C 只退出日志
 ```
 
-`deploy` 会编译、转换并提交后台启动。转换可能持续较长时间，远程执行建议先进入 `tmux new -s llm-deploy`，避免 SSH 中断。后台启动成功提交后，模型仍需要加载，通过以下命令确认就绪。
+`setup` 使用当前 `CONDA_PREFIX/bin/python`，先验证 CUDA 与 sm_70，再把已有 Torch / torchvision / torchaudio / Triton 版本写入约束。后续 pip 包括构建子进程继承约束；**冲突时退出，不自动换成 Torch 2.11**。已有 Torch 必须本身包含 V100 CUDA 支持，只有版本号相同还不够。
+
+建议给三个 Python 后端各自建环境，复用版本、隔离其余依赖：
 
 ```bash
-bash llm.sh status
-curl -f http://127.0.0.1:8080/health
+conda create -n llm-transformers --clone 你的原环境名
+conda create -n llm-vllm --clone 你的原环境名
 ```
 
-输入 `Ctrl+C` 退出日志查看，后台服务继续运行。重复 `deploy` 会复用已有源码和 GGUF，不会自动更新 llama.cpp。首次实际提交记录在 `.runtime/llama-cpp-commit.txt`。更换源模型目录时，应使用新的仓库工作目录，避免误用之前转换的同名 GGUF。一个工作目录内依次执行部署命令。
+克隆会复制已安装的 Torch，不重新下载 Torch。不同环境占用更多磁盘，但避免互相改动 Transformers、Triton 等依赖。也可直接使用现有环境，需接受其他 Python 依赖会被安装/调整。
 
-## 从 Mac 访问
+SGLang 的专用环境步骤见 [sglang/README.md](sglang/README.md)，它不能按本适配版直接复用 2.10。
 
-使用 Conda 时，先按下一节准备环境，再执行 deploy。
+## 公共命令与配置
 
-```bash
-ssh -N -L 8080:127.0.0.1:8080 用户名@服务器地址
-```
-
-浏览器打开 <http://127.0.0.1:8080>。DSH / OpenCode 使用 OpenAI Compatible 类型，Base URL 填 `http://127.0.0.1:8080/v1`，模型名填 `qwen3.8-27b`。客户端要求 API Key 时可填占位值，默认服务通过本机和 SSH 隧道访问。
-
-```bash
-curl -N http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"你好，简短介绍自己。"}],"stream":true,"max_tokens":1024,"chat_template_kwargs":{"reasoning_effort":"low"}}'
-```
-
-## 配置 API Key
-
-生成一个密钥，将输出保存在本机 `.env` 的 `API_KEY`，客户端也填写同一字符串。
-
-```bash
-python -c 'import secrets; print(secrets.token_hex(32))'
-```
-
-`.env` 示例，端口按本机实际配置填写。
-
-```bash
-HOST=0.0.0.0
-PORT=8081
-API_KEY="替换成刚生成的密钥"
-```
-
-执行 `bash llm.sh stop`，再用 `bash llm.sh status` 确认旧进程退出，然后执行 `bash llm.sh start`。设置密钥只需要重启服务。密钥通过 llama-server 原生的 `LLAMA_API_KEY` 环境变量传入，日志和进程命令行参数不包含该值。`.env` 已被 Git 忽略。
-
-局域网客户端的 Base URL 填 `http://服务器局域网IP:8081/v1`，API Key 填生成的字符串，Model ID 填 `qwen3.8-27b`。HTTP 请求头使用 `Authorization: Bearer 密钥`。
-
-```bash
-read -r -s -p 'API Key: ' QWEN_CLIENT_KEY
-echo
-curl -N http://服务器局域网IP:8081/v1/chat/completions \
-  -H "Authorization: Bearer $QWEN_CLIENT_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"你好"}],"max_tokens":256,"stream":true}'
-unset QWEN_CLIENT_KEY
-```
-
-验证鉴权时使用推理接口，分别测试正确、错误和未提供密钥的情况。`/health` 等公共端点可能允许匿名访问，不能用健康检查成功来判断鉴权是否生效。内置聊天网页需要在其 API Key 设置中填相同密钥。
-
-## 使用 Conda 或 venv
-
-推荐专门建立转换环境，避免影响其他项目。
-
-```bash
-conda create -n llm-server python=3.11 pip -y
-conda activate llm-server
-git pull
-```
-
-在 `.env` 加入 `PYTHON_ENV=conda`，然后执行 `bash llm.sh deploy`。setup、convert、deploy 都会使用 `$CONDA_PREFIX/bin/python`，日志会打印实际路径。已有 `.runtime/venv` 可以保留，Conda 模式使用激活环境。再次转换或安装依赖前，重新激活同一个 Conda 环境。启动已转换的模型由 C++ 后端执行。
-
-`PYTHON_ENV=auto` 会在激活 Conda 时使用 Conda，其余情况使用 venv。希望固定行为时显式填写 `conda` 或 `venv`。
-
-setup 优先复用该环境中能够正常导入的 Torch，包括已有的 2.10。安装其他转换依赖时，脚本移除上游对 Torch 的直接固定版本，并通过 pip constraints 约束当前 Torch 版本。若其他依赖与当前版本冲突，pip 会报错，需要结合日志处理。环境没有 Torch 时按上游 requirements 安装。安装后会运行转换器 `--help` 检查入口导入，完整模型转换仍需实际验证。llama-server 推理由 C++ / CUDA 后端执行，Torch 用于 Python 转换步骤。
-
-继续使用 venv 时，设置 `PYTHON_ENV=venv` 和 `PYTHON_BIN=python3.11`。已存在旧版 Python 的 venv 需要先改名备份，例如 `mv .runtime/venv .runtime/venv-backup-$(date +%s)`，再执行 deploy。只处理这个子目录，源码和已转换的模型位于 `.runtime` 的其他子目录。
-
-## 管理命令
+在相应目录执行：
 
 | 命令 | 用途 |
-| --- | --- |
-| `bash llm.sh doctor` | 查看 GPU、拓扑、Toolkit、主机内存和磁盘 |
-| `bash llm.sh diagnose` | 查看性能配置、GPU 快照、拓扑与最近输入/生成耗时 |
-| `bash llm.sh setup` | 编译后端并安装转换依赖 |
-| `bash llm.sh convert` | 转换权重，成功后才发布最终文件 |
-| `bash llm.sh start` | 在 tmux 中启动后台服务 |
-| `bash llm.sh restart` | 等待旧服务退出，再按当前 .env 配置启动 |
-| `bash llm.sh run` | 前台运行，Ctrl+C 停止 |
-| `bash llm.sh status` | 查看后台会话、健康检查和 GPU |
-| `bash llm.sh logs` | 查看后台加载和推理日志 |
-| `bash llm.sh stop` | 请求停止本目录启动的后台服务 |
+|---|---|
+| `bash llm.sh doctor` | Python/Torch/CUDA、GPU 列表、`nvidia-smi topo -m` |
+| `bash llm.sh setup` | 安装或源码编译，不加载模型；重复执行复用源码 |
+| `bash llm.sh start` | 后台启动；使用 setup 记录的 Conda 解释器 |
+| `bash llm.sh run` | 前台启动，便于查看完整报错 |
+| `bash llm.sh restart` | 修改 `.env` 后重启；无需再复制 env |
+| `bash llm.sh stop` | 向本目录服务的真实 pane ID 发送 Ctrl+C，最多等待 30 秒 |
+| `bash llm.sh status` | tmux 状态 + HTTP `/health`；加载中可能尚未通过 |
+| `bash llm.sh logs` | 本后端日志 |
+| `bash llm.sh diagnose` | GPU 信息 + 最近日志 |
+| `bash llm.sh ui` | 前台启动共用的网页聊天/监控服务 |
 
-tmux 服务持续到退出或主机重启，重启服务器后执行 `bash llm.sh start`。修改 HOST、PORT、API_KEY 等运行参数后执行 `bash llm.sh restart`。stop 会查询 pane ID 发送 Ctrl+C，并等待最多 30 秒退出，超时会报错，restart 随之停止。日志保存在 `.runtime/server.log`，每次后台启动重新写入。
+`deploy` = setup + start（llama.cpp 还包含转换）。改密钥、IP、选卡、上下文后用 `restart`；改依赖或源码版本才需 setup。setup/start/stop/restart 有目录级互斥锁，避免重复操作。
 
-## 用 topo 选卡
+新三套环境的状态放各自 `.runtime/`。`.env`、运行产物、权重不会提交到 Git。密码含 `$` 等 Shell 字符时使用单引号：`API_KEY='字面量密钥'`。`.env` 是本机 Shell 配置文件，可以用数组 `EXTRA_ARGS=(--某参数 某值)`，不要粘贴不可信脚本。
 
-执行 `bash llm.sh doctor`，看 `nvidia-smi topo -m` 中 GPU 行与 GPU 列的交叉位置。
+## 网页聊天、图片与监控
 
-| 标记 | 连接路径 |
-| --- | --- |
-| `PIX` | 最多经过一个 PCIe 桥 |
-| `PXB` | 经过多个 PCIe 桥 |
-| `PHB` | 经过 PCIe Host Bridge |
-| `NODE` | 同一 NUMA 节点内跨 Host Bridge |
-| `SYS` | 跨 NUMA 节点，通过 CPU 间互联 |
-| `NV#` | NVLink 连接 |
-
-两卡优先选 PIX / PXB 且空闲显存充足的一组。若 0、1 为一组，2、3 为另一组，组间为 SYS，可以用 `GPU_IDS="0,1"` 或 `GPU_IDS="2,3"`。四卡按 `0,1,2,3` 排序，尽量把同组卡放在一起。实际速度需要测试，拓扑标记不代表保证带宽，四卡按层分配也不会保证四倍生成速度。
-
-`GPU_IDS` 接受 nvidia-smi 的 index 或完整 UUID。脚本先将 index 转为 UUID，再传给 CUDA，进程内部按所填顺序从 CUDA 0 重新编号。无需手动配置 `tensor-split`，脚本按卡数设置相同比例。
-
-## 常用配置
-
-在 `.env` 修改后按需转换、重启。
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `MODEL_DIR` | 必填 | 原始模型目录 |
-| `GPU_IDS` | `0,1,2,3` | 指定 GPU 顺序 |
-| `PRECISION` | `f16` | 可设 `q8_0`，重新 convert / deploy |
-| `VISION` | `0` | 设为 `1` 后 convert，会额外生成视觉模块 |
-| `MEDIA_PATH` | `/` | 本地媒体文件根目录，空字符串关闭本地文件访问 |
-| `CTX_SIZE` | `32768` | 输入与输出合计容量 |
-| `PORT` | `8080` | HTTP 服务端口 |
-| `HOST` | `127.0.0.1` | 默认仅本机监听 |
-| `API_KEY` | 空 | 推理 API 密钥，修改后重启服务 |
-| `FLASH_ATTN` | `auto` | 可改 `off` 排查兼容性 |
-| `REASONING_EFFORT` | 空 | 默认遵循模型模板，可显式设 `low` / `medium` / `xhigh` |
-| `BATCH_SIZE` | `512` | 逻辑输入批次 |
-| `UBATCH_SIZE` | `128` | 物理输入批次，需小于等于 BATCH_SIZE |
-| `CUDA_HOME` | 空 | 可填 `/usr/local/cuda-12.8` |
-| `BUILD_JOBS` | `8` | 编译并行任务数 |
-| `PYTHON_ENV` | `auto` | 自动选择激活的 Conda 或 venv，也可显式指定 `conda` / `venv` |
-| `PYTHON_BIN` | `python3` | venv 模式创建环境的 Python，要求 >=3.10，建议 3.11/3.12 |
-| `LLAMA_REF` | 空 | 首次 clone 时选择 tag / commit |
-
-F16 是把 BF16 转为 FP16，均为 16-bit，转换存在舍入。Q8 会减少权重占用。转换在 CPU 上进行，生成文件大小与 GPU 运行显存不同，KV 和计算缓冲会额外占用显存。
-
-## 本机图片输入
-
-按用户的根目录访问需求，脚本默认传入 `--media-path /`。已有 `.env` 无需补充该字段即可使用此默认值。设置 `MEDIA_PATH=""` 可关闭本地文件访问，也可设置为具体图片目录。
-
-图片输入需要在 `.env` 中设置 `VISION=1`。首次启用后，执行 `bash llm.sh convert` 生成视觉模块，再执行 `bash llm.sh restart` 加载。
-
-例如服务器图片位于 `/data/images/test.jpg`，请求中的消息内容可以写为以下形式。
-
-```json
-[
-  {"type": "text", "text": "请描述这张图片。"},
-  {"type": "image_url", "image_url": {"url": "file://data/images/test.jpg"}}
-]
-```
-
-`file://` 后填写相对于 MEDIA_PATH 的路径。若改成 `MEDIA_PATH="/data/images"`，同一图片使用 `file://test.jpg`。目录必须存在于模型服务器上，且服务进程具有读取权限。根目录配置的访问范围覆盖整个服务器文件系统中进程可读的媒体文件。
-
-修改 MEDIA_PATH 后执行 `bash llm.sh restart`。通过其他电脑调用时，客户端电脑上的图片可以用 Base64 data URI 发送。当前更新仅涉及启动参数和说明，目标 GPU 上的图片推理仍需实测。
-
-## UI 和监控
-
-本脚本直接提供 llama.cpp 内置聊天网页。模型管理后台可以后续接 LocalAI，需使用其自己的后端重新验证兼容性。
+模型服务启动后，在同一部署目录另开终端：
 
 ```bash
-nvidia-smi -l 1
-curl http://127.0.0.1:8080/metrics
+conda activate 对应环境
+bash llm.sh ui
 ```
 
-`--metrics` 默认开启，可由 Prometheus 采集。重点看 `llamacpp:prompt_tokens_seconds`、`llamacpp:predicted_tokens_seconds`、`llamacpp:requests_processing`、`llamacpp:requests_deferred`。长期 GPU 历史监控可以增加 DCGM Exporter 和 Grafana。
+例如 Transformers 浏览器打开 `http://127.0.0.1:8181`。输入与 `.env` 一致的 API 密钥，即可流式聊天、上传图片、刷新健康状态、GPU 显存/占用/功耗和原始 Prometheus 指标。页面密钥仅保存在页面内存，不写入浏览器存储。默认 UI 仅本机访问；远程可 SSH 转发，或在 `.env` 设置 `UI_HOST="0.0.0.0"` 后重新运行 UI。API 与 UI 是两个独立进程，停模型不会关闭 UI；UI 用 Ctrl+C 关闭。
 
-## 排查
+llama.cpp 自带的 Web UI 仍可直接使用。新增共用 UI 通过同源代理访问 API，不要求后端打开 CORS。监控显示服务器全部 GPU，便于检查残留进程；原始指标中的 token 统计/时延含义由各后端定义，不能直接把累计吞吐当单请求 decode 速度。
 
-### 服务很慢
+## API 接入
 
-先完成一条真实请求，再执行 `bash llm.sh diagnose`。在请求生成过程中运行 `nvidia-smi -l 1`，观察有无其他占用和异常显存。日志的 `prompt eval time` 对应输入处理，`eval time` 对应输出生成。客户端等到正文的时间还可能包含模型思考和排队。
+四个后端统一 `MODEL_ID=qwen3.8-27b`（llama.cpp 原有固定别名也是这个）。客户端填写：
 
-1. 正文等待过久时，先在 `.env` 设置 `REASONING_EFFORT=low` 并执行 restart，对比同一问题。客户端显式传入的 `chat_template_kwargs` 可以覆盖服务默认值。降低思考强度可能影响复杂任务成功率。
-2. 输入处理慢且显存有余量时，比较 `UBATCH_SIZE=128` 和 `256`，每次修改后 restart；较大批次可能增加显存峰值。保留测得更快的一组。
-3. F16 四卡的单请求生成速度慢时，可以对比同拓扑组的两卡配置，但 F16 约 54GB，再加 KV 和缓冲后两卡可能余量不足。可先用短上下文验证，完整 GPU 卸载以日志为准。
-4. 若接受量化，可使用 `PRECISION=q8_0` 后执行 convert，对比 Q8 两卡和原 F16 配置。权重减小可能降低读取成本，实际吞吐也受 Volta 的量化算子与 PCIe 拓扑影响。
-5. 当前脚本固定一个请求槽位，多人请求会排队。先测单请求性能，再决定是否用两组卡运行副本或调整并发。
+```text
+Base URL: http://服务器局域网IP:后端端口/v1
+API key:  .env 中的 API_KEY
+Model:    qwen3.8-27b
+```
 
-逐项修改，以同一输入、同一输出长度对照。当前按层分卡时，一个序列逐层经过各 GPU，四卡不保证单请求四倍速度。保留 `FLASH_ATTN=auto`，通过日志确认实际启用情况。V100 上的具体速度以测量为准。
+`HOST=0.0.0.0` 是服务监听地址；客户端必须填服务器实际 IP。不同目录默认端口不同，旧 `.env` 中自定义端口保持原值。
 
-| 问题 | 处理 |
-| --- | --- |
-| 找不到 nvcc | 安装 Toolkit 或设置 CUDA_HOME |
-| pip 找不到 numpy 2.2.6 | 查看日志打印的实际解释器并检查版本，NumPy 2.2.6 要求 Python >=3.10；同时检查 pip 镜像和网络 |
-| compute_70 不受支持 | 使用 CUDA Toolkit 12.x |
-| 缺少分片 / tokenizer | 补全原始模型目录 |
-| unknown model architecture | 后端版本可能太旧，使用支持该架构的 llama.cpp 版本 |
-| 显存不足 | 先设 CTX_SIZE=8192，检查占用和 GPU_IDS |
-| Flash Attention 错误 | 设 FLASH_ATTN=off 后重启 |
-| start 后健康检查失败 | 首次加载需要时间，查看 logs 确认原因 |
-| CUDA 无可用 kernel | 检查实际二进制是否为本脚本构建的 sm_70 版本 |
+```bash
+# 以 Transformers 为例；不要把密钥写进仓库
+export TEST_API_KEY='你的密钥'
+curl http://127.0.0.1:8081/v1/chat/completions \
+  -H "Authorization: Bearer $TEST_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"你好"}],"max_tokens":256,"stream":true}'
+```
 
-本仓库已验证 Shell 语法和模拟启动流程。完整的转换、四卡 GPU 推理、图片与工具调用需在目标服务器验收。源码仓库与 `.env` 不包含模型权重，所有运行产物保存在被 Git 忽略的 `.runtime/`。
+图片消息采用 OpenAI `image_url` 格式：
 
-如果旧 venv 使用 Python 3.8/3.9，可按上文切换到 Conda，或使用新版解释器重建 venv。Conda 环境本身版本太旧时，也需要创建或切换到新版 Python 的 Conda 环境。
+```json
+{"model":"qwen3.8-27b","messages":[{"role":"user","content":[{"type":"text","text":"描述这张图片"},{"type":"image_url","image_url":{"url":"file:///data/images/test.jpg"}}]}],"max_tokens":256}
+```
 
-Python 版本符合要求时，用实际解释器执行 `python -m pip download --no-deps --only-binary=:all: --index-url https://pypi.org/simple numpy==2.2.6 -d /tmp/llm-numpy-check` 检查官方源是否提供匹配文件。venv 模式将命令中的 `python` 替换为 `.runtime/venv/bin/python`。若官方源成功而原安装失败，检查镜像同步、pip 配置和代理。此命令只下载，完整错误日志仍需结合实际环境判断。
+这是**服务器本机文件**。客户端电脑的图片使用网页上传（base64）或客户端自行转 data URL。Transformers、vLLM、SGLang 不需要 mmproj；只有 llama.cpp 需要 `VISION=1` 并转换 mmproj。
 
-参考 [llama.cpp](https://github.com/ggml-org/llama.cpp)、[NVIDIA 拓扑说明](https://docs.nvidia.com/deploy/nvidia-smi/index.html)、[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)。
+`MEDIA_PATH="/"` 延续之前允许整个文件系统的设置；可收窄为 `/data/images`，空字符串禁用本地 `file://`。SGLang 的限制通过本仓库 HTTP 中间件作用于 `/v1/chat/completions`、`/generate` 的本地媒体输入；不覆盖其他原生管理/文件接口。生产使用建议只暴露 OpenAI 接口。Transformers 基线不支持工具调用、并发批处理、视频/音频输入；Agent 工具调用用另外三个后端。
+
+## 选卡与性能比较
+
+```bash
+nvidia-smi --query-gpu=index,uuid,name,memory.free --format=csv
+nvidia-smi topo -m
+```
+
+`GPU_IDS` 填 **nvidia-smi 的物理编号**或 UUID，以你的拓扑矩阵选择。两卡优先选择 `PIX`/`PXB`、再比较 `PHB`，跨 CPU 的 `SYS` 通常通信代价更大；同时确认空闲显存。不要默认编号相邻就最近。本仓库会将编号转成 UUID 再设置 CUDA_VISIBLE_DEVICES，避免编号重排。
+
+27B FP16 权重本身约 50 多 GiB，**单张 32GB 放不下**；新三套默认四卡，建议先成功再按拓扑比较两卡。单卡量化继续用现有 llama.cpp Q8_0，能否完整驻留需同时考虑视觉模块、KV cache 和上下文预算。
+
+Transformers 的 `device_map=auto` 是层分配，多卡并不等于每层张量并行，通常不适合作为提速首选。vLLM/SGLang 使用 TP，PCIe 通信可能影响延迟；默认关闭自定义 all-reduce，不启用 NVLink/NVLS 专用参数，也不强制 `NCCL_P2P_LEVEL=NVL`。先测 FP16 正确性，再考虑特殊量化或投机解码。
+
+对比时固定相同输入、输出长度、思考设置、图片分辨率和上下文，预热后重复几次。分别记录 TTFT、单请求 decode tokens/s、多人总吞吐。SGLang 的 NVLink / FP8 / DFlash 测试值不代表本脚本的 PCIe / FP16 默认配置。
+
+## 系统依赖 / 排错
+
+需要已有 NVIDIA 驱动、对应 CUDA 12.x Toolkit（vLLM 12.6–12.8，SGLang 12.8）、C/C++ 编译器、git、tmux、flock；新 Python 后端要求 Python >=3.11，建议 3.12。不要求 Docker。
+
+Ubuntu/Debian 安装基础工具（按服务器权限自行执行一次）：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential git tmux util-linux curl cmake ninja-build g++-12
+```
+
+- Conda 不会接管 `pip` 的解析器；脚本使用当前环境的 `python -m pip`，并额外限制现有 Torch 版本。`ResolutionImpossible` 时保留报错，不要去掉约束强装。
+- `couldn't bind`：检查 `ss -ltnp`、HOST 是否属于本机、端口是否冲突。四套虽端口不同，仍共享 GPU 显存。
+- `no kernel image` / `sm_70`：检查 Torch 架构列表和本地编译结果。不要直接换成 CUDA13 或最新版预编译推理轮子。
+- 更改源码 REF 后，已有 checkout 版本不匹配会退出；保留旧 `.runtime/source` 并改名，再 setup。不会自动覆盖自定义源码改动。
+- `start` 返回仅表示创建了后台会话；必须查看 logs/status 确认模型加载成功。首轮 JIT 可能较久。
+- 原 llama.cpp 的转换、q8、mmproj、CUDA 构建细节见 [旧部署说明](llama.cpp/README.md)。
+
+## 来源与验证
+
+- [Qwen3.8-27B 模型卡](https://huggingface.co/Qwen/Qwen3.8-27B)
+- [vLLM v0.19.1 源码](https://github.com/vllm-project/vllm/tree/b1388b1fbf5aaef47937fabe98931211684666a6)、[既有 Torch 构建说明](https://docs.vllm.ai/en/v0.19.1/getting_started/installation/gpu/)
+- [V100 vLLM 社区复现](https://github.com/KumphanartDansiri/v100-vllm-2026)（其他模型/拓扑的复现证据，不是本项目硬件验收）
+- [SGLang-V100 固定版本](https://github.com/haohervchb/sglang-V100/tree/d85b3e2705411df781dadf9e8fa4db52c8f07a5a)，保留其上游依赖补丁、sm_70 构建和 smoke checks；本项目不复制其内核源码。
+
+本地无 GPU 测试：
+
+```bash
+python -m pip install pytest fastapi httpx requests prometheus-client pillow uvicorn
+python -m pytest -q tests
+```
+
+测试中的 Torch/Transformers 模型是 mock；不会下载 27B 模型，也不能证明 GPU 内核兼容或模型回答正确。
